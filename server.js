@@ -1,23 +1,32 @@
-// server.js
-import express from "express";
-import bodyParser from "body-parser";
-import axios from "axios";
+// server.js  (CommonJS)
+const express = require("express");
+const axios = require("axios");
 
+// ---------- config ----------
+const PORT           = process.env.PORT || 3000;
+const API_KEY        = process.env.API_KEY || ""; // protects /maintenance
+const SLEEP_AGENT_ID = process.env.SLEEP_AGENT_ID || "agent-2bbec9ee-ea96-4278-9cd0-08cc586ad5d8";
+
+// Which way to call Letta: "maintenance" (direct endpoint) or "call" (generic send-message)
+const LETTA_MODE     = (process.env.LETTA_MODE || "maintenance").toLowerCase();
+
+// Base URL and token for your Letta runtime
+const LETTA_BASE_URL = (process.env.LETTA_BASE_URL || "").replace(/\/+$/,""); // strip trailing slashes
+const LETTA_TOKEN    = process.env.LETTA_TOKEN || "";
+
+// Overrideable paths (so you don’t have to edit code if your runtime uses different routes)
+const LETTA_MAINT_PATH = process.env.LETTA_MAINT_PATH || "/agents/:id/maintenance"; // :id will be replaced
+const LETTA_CALL_PATH  = process.env.LETTA_CALL_PATH  || "/agent/call";             // adjust if needed
+
+// ---------- app ----------
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 
-// ---- Config ----
-const PORT            = process.env.PORT || 3000;
-const API_KEY         = process.env.API_KEY || "";
-const SLEEP_AGENT_ID  = process.env.SLEEP_AGENT_ID || "agent-2bbec9ee-ea96-4278-9cd0-08cc586ad5d8";
-const LETTA_BASE_URL  = (process.env.LETTA_BASE_URL || "").replace(/\/+$/,"");
-const LETTA_TOKEN     = process.env.LETTA_TOKEN || "";
-// Choose which upstream you actually have: "maintenance" or "call"
-const LETTA_MODE      = (process.env.LETTA_MODE || "maintenance").toLowerCase(); 
-
+// auth gate for /maintenance
 function okAuth(req, res) {
   if (!API_KEY) return true;
-  if ((req.headers.authorization || "") !== `Bearer ${API_KEY}`) {
+  const a = req.headers.authorization || "";
+  if (a !== `Bearer ${API_KEY}`) {
     res.status(401).json({ error: "Unauthorized" });
     return false;
   }
@@ -30,18 +39,24 @@ function lettaHeaders() {
   return h;
 }
 
-// A) If your Letta runtime exposes a maintenance endpoint
+// A) direct maintenance endpoint: POST {BASE}/agents/:id/maintenance
 async function callLettaMaintenance(agentId) {
   if (!LETTA_BASE_URL) throw new Error("LETTA_BASE_URL not set");
-  const url = `${LETTA_BASE_URL}/agents/${agentId}/maintenance`;
-  const body = { operation: "rethink_all", reason: "scheduled-maintenance", timestamp: new Date().toISOString() };
+  const path = LETTA_MAINT_PATH.replace(":id", agentId);
+  const url  = `${LETTA_BASE_URL}${path}`;
+  const body = {
+    operation: "rethink_all",
+    reason: "scheduled-maintenance",
+    timestamp: new Date().toISOString()
+  };
+  console.log("[upstream] POST", url);
   return axios.post(url, body, { headers: lettaHeaders() });
 }
 
-// B) If maintenance is done by sending a normal message to an agent “call” endpoint
+// B) generic call endpoint: POST {BASE}/agent/call  (or whatever you override)
 async function callLettaGeneric(agentId) {
   if (!LETTA_BASE_URL) throw new Error("LETTA_BASE_URL not set");
-  const url = `${LETTA_BASE_URL}/agent/call`; // adjust if your runtime uses a different path
+  const url  = `${LETTA_BASE_URL}${LETTA_CALL_PATH}`;
   const body = {
     message: {
       text: "maintenance: rethink_all (scheduled)",
@@ -52,9 +67,11 @@ async function callLettaGeneric(agentId) {
     other_agent_id: agentId,
     request_heartbeat: true
   };
+  console.log("[upstream] POST", url);
   return axios.post(url, body, { headers: lettaHeaders() });
 }
 
+// -------- routes --------
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -62,16 +79,18 @@ app.get("/health", (_req, res) => {
     mode: LETTA_MODE,
     hasBaseUrl: Boolean(LETTA_BASE_URL),
     hasToken: Boolean(LETTA_TOKEN),
-    agent: SLEEP_AGENT_ID
+    agent: SLEEP_AGENT_ID,
+    maintPath: LETTA_MAINT_PATH,
+    callPath: LETTA_CALL_PATH
   });
 });
 
 app.post("/maintenance", async (req, res) => {
   if (!okAuth(req, res)) return;
 
-  // Accept both payloads (with or without agent_id)
+  // accept either payload with/without agent_id; be lenient on instruction text
   const { instruction, agent_id } = req.body || {};
-  if (instruction && instruction.indexOf("rethink") === -1 && instruction.indexOf("cleanup") === -1) {
+  if (instruction && !/rethink|cleanup/i.test(instruction)) {
     return res.status(400).json({ error: "Unknown instruction" });
   }
   if (agent_id && agent_id !== SLEEP_AGENT_ID) {
@@ -83,14 +102,19 @@ app.post("/maintenance", async (req, res) => {
       ? await callLettaGeneric(SLEEP_AGENT_ID)
       : await callLettaMaintenance(SLEEP_AGENT_ID);
 
-    return res.json({ ok: true, upstream_status: resp.status, upstream: resp.data });
+    return res.json({
+      ok: true,
+      upstream_status: resp.status,
+      upstream: resp.data
+    });
   } catch (e) {
-    const status = e.response?.status || 500;
-    const data   = e.response?.data || e.message;
-    console.error("[/maintenance] upstream error:", status, data);
-    // Bubble up exact upstream error so we can see what's wrong
-    return res.status(500).json({ error: "Upstream failed", status, details: data });
+    const status  = e.response?.status || 500;
+    const details = e.response?.data || e.message;
+    console.error("[/maintenance] upstream error:", status, details);
+    return res.status(500).json({ error: "Upstream failed", status, details });
   }
 });
 
-app.listen(PORT, () => console.log(`Sleep maintenance server on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Sleep maintenance server on :${PORT}`);
+});
