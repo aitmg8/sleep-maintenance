@@ -1,12 +1,11 @@
 {
   "name": "sleep-maintenance",
   "version": "1.0.0",
-  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "axios": "^1.6.0"
+    "body-parser": "^1.20.2"
   }
 }
