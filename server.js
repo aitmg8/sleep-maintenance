@@ -1,70 +1,70 @@
-// server.js (CommonJS)
-const express = require("express");
-const bodyParser = require("body-parser");
 const fetch = require("node-fetch");
 
-const app = express();
-app.use(bodyParser.json());
+async function tryPostPaths(baseUrl, token, agentId, payload, paths) {
+  const headers = {
+    "Authorization": `Bearer ${token}`,
+    "Content-Type": "application/json"
+  };
 
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY;                  // auth for Apps Script → Railway
-const LETTA_BASE_URL = process.env.LETTA_BASE_URL;    // e.g., https://letta…/api
-const LETTA_TOKEN = process.env.LETTA_TOKEN;          // Bearer token for Letta
-const DEFAULT_AGENT = process.env.SLEEP_AGENT_ID;     // optional fallback
+  const errors = [];
+  for (const raw of paths) {
+    const path = raw.replace(":id", encodeURIComponent(agentId));
+    const url = `${baseUrl.replace(/\/+$/,"")}${path}`;
+    console.log("[upstream] POST", url);
+    try {
+      const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+      const text = await r.text();
+      let data; try { data = JSON.parse(text); } catch { data = text; }
 
-function ok(res, json) { res.status(200).json(json); }
-function bad(res, code, msg) { res.status(code).json({ error: msg }); }
+      if (r.ok) return { ok: true, url, status: r.status, data };
+      errors.push({ url, status: r.status, data });
+      // if 404, continue to next path; if 401/403, break early
+      if (r.status === 401 || r.status === 403) break;
+    } catch (e) {
+      errors.push({ url, error: String(e) });
+    }
+  }
+  return { ok: false, errors };
+}
 
-// Health
-app.get("/health", (req, res) => {
-  ok(res, {
-    ok: true,
-    ts: new Date().toISOString(),
-    hasToken: !!LETTA_TOKEN,
-    hasBaseUrl: !!LETTA_BASE_URL
-  });
-});
-
-// Maintenance → forward to Letta
 app.post("/maintenance", async (req, res) => {
-  // Validate caller (Apps Script)
   const auth = req.headers.authorization || "";
-  if (auth !== `Bearer ${API_KEY}`) return bad(res, 403, "Unauthorized");
+  if (auth !== `Bearer ${API_KEY}`) return res.status(403).json({ error: "Unauthorized" });
 
   const agentId = req.body.agent_id || DEFAULT_AGENT;
   const instruction = req.body.instruction || "Nightly rethink & cleanup";
-  if (!agentId) return bad(res, 400, "Missing agent_id and no DEFAULT_AGENT");
+  if (!agentId) return res.status(400).json({ error: "Missing agent_id and no DEFAULT_AGENT" });
 
-  // Build Letta request
-  const url = `${LETTA_BASE_URL}/agents/${encodeURIComponent(agentId)}/maintenance`;
-  const body = {
-    instruction,             // free text for your Sleep agent (optional)
-    mode: "rethink",         // hint to run memory_rethink
-    scope: "archival/*"      // hint: restrict to archival labels
-  };
+  // Two possible payload shapes (switch via env if you want)
+  const style = (process.env.CALL_BODY_STYLE || "1").trim();
+  const payload = style === "2"
+    ? { text: instruction, agent_id: agentId } // Body style 2
+    : {                                        // Body style 1
+        message: {
+          text: instruction,
+          source: "maintenance",
+          priority: "normal",
+          request_heartbeat: true
+        },
+        other_agent_id: agentId,
+        request_heartbeat: true
+      };
 
-  try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${LETTA_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
+  // Try likely endpoints in order (override with env LETTA_PATHS if you want)
+  const defaultPaths = [
+    "/agents/:id/maintenance",
+    "/agents/:id/call",
+    "/agents/call",
+    "/agent/call"
+  ];
+  const paths = (process.env.LETTA_PATHS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+  const tryPathsList = paths.length ? paths : defaultPaths;
 
-    const text = await r.text();
-    const result = tryJson(text);
+  const result = await tryPostPaths(LETTA_BASE_URL, LETTA_TOKEN, agentId, payload, tryPathsList);
 
-    if (!r.ok) {
-      return res.status(r.status).json({ error: "Upstream failed", status: r.status, details: result || text });
-    }
-    ok(res, { ok: true, forwarded: { agent_id: agentId, instruction }, upstream: result });
-  } catch (e) {
-    bad(res, 502, `Forward error: ${String(e)}`);
-  }
+  if (result.ok) return res.json({ ok: true, forwarded: { agent_id: agentId, instruction }, upstream: result });
+  return res.status(502).json({ error: "Upstream not found or failed", attempts: result.errors });
 });
-
-function tryJson(s){ try { return JSON.parse(s) } catch { return null } }
-
-app.listen(PORT, () => console.log(`Sleep maintenance server on :${PORT}`));
